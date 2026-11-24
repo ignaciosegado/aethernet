@@ -1,5 +1,5 @@
 """
-AETHERNET - Core Navigation Engine (Production / Hardware-Ready v1.0)
+AETHERNET - Core Navigation Engine (Production / Hardware-Ready v1.1)
 =====================================================================
 Módulo desacoplado de hardware listo para desplegar en:
   - Companion Computer (Raspberry Pi / Jetson / Orange Pi en Python)
@@ -10,7 +10,7 @@ Características implementadas:
   2. Desacoplo de sesgos IMU durante actualizaciones relativas (evita inestabilidad por geometría colineal).
   3. Gating estadístico Chi-cuadrado (NIS) con recuperación anti-secuestro contra rebotes NLOS y spoofing GNSS.
   4. Protocolo binario compacto (struct) para transmisión por radio/UWB/UDP de bajo ancho de banda (26 bytes/paquete).
-  5. Bucle asíncrono orientado a eventos (IMU @ 50-100 Hz, UWB @ 10-20 Hz, Anchor @ 1-2 Hz).
+  5. Bucle asíncrono orientado a eventos (IMU @ 50-200 Hz, UWB @ 10-20 Hz, Anchor @ 1-2 Hz).
 """
 
 import time
@@ -24,8 +24,8 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
 # --- Protocolo de Paquete de Red (26 bytes exactos - apto para enlace de baja tasa) ---
-# Formato: Header(2B) | NodeID(1B) | Flags(1B) | Timestamp_ms(4B) | X(4B) | Y(4B) | Pxx(2B) | Pxy(2B) | Pyy(2B) | Range_mm(2B) | CRC16(2B)
-PACKET_FORMAT = '<2sBBIffhhhH'
+# Formato: Header(2B) | NodeID(1B) | Flags(1B) | Timestamp_ms(4B) | X(4B) | Y(4B) | Pxx(2B) | Pxy(2B) | Pyy(2B) | Range_mm(2B, uint16) | CRC16(2B)
+PACKET_FORMAT = '<2sBBIffhhhHH'
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 MAGIC_HEADER = b'AE'
 
@@ -53,8 +53,8 @@ class EKFConfig:
     uwb_noise_std: float = 0.12       # m (calibrar con módulos DW3000)
     chi2_gate_1d: float = 9.0         # Umbral nominal para rechazo de outliers UWB
     chi2_gate_2d: float = 9.21        # Umbral 99% para rechazo de spoofing GNSS
-    peer_cov_inflation: float = 4.0   # Factor conservador Schmidt-EKF para covarianza de vecino
-    batch_corr_factor: float = 0.80   # Factor de correlación de lote CI
+    peer_cov_inflation: float = 6.0   # Factor conservador Schmidt-EKF para covarianza de vecino
+    batch_corr_factor: float = 1.60   # Factor de correlación de lote CI (mantiene NEES ~ 2)
     max_dt: float = 0.5               # Límite de seguridad si hay lag en el hilo IMU
 
 
@@ -74,14 +74,15 @@ class AethernetNavigator:
         self.gnss_healthy: bool = False
         self.initialized: bool = False
         self.consecutive_rejects: int = 0
+        self.consecutive_gnss_rejects: int = 0
 
     def initialize_state(self, pos_xy: np.ndarray, vel_xy: Optional[np.ndarray] = None, pos_std: float = 0.5):
         with self.lock:
             self.x[:2] = pos_xy
             self.x[2:4] = vel_xy if vel_xy is not None else np.zeros(2)
             self.x[4:6] = np.zeros(2)
-            v_std = 1e-4 if self.is_static_anchor else 0.2
-            b_std = 1e-4 if self.is_static_anchor else self.cfg.bias_residual_std
+            v_std = 1e-3 if self.is_static_anchor else 0.2
+            b_std = 1e-3 if self.is_static_anchor else self.cfg.bias_residual_std
             self.P = np.diag([pos_std**2, pos_std**2, v_std**2, v_std**2, b_std**2, b_std**2])
             self.initialized = True
             logging.info(f"Nodo {self.node_id} inicializado en {pos_xy} (Ancla={self.is_static_anchor})")
@@ -133,7 +134,8 @@ class AethernetNavigator:
     def update_gnss_or_anchor(self, pos_xy: np.ndarray, pos_std: float) -> bool:
         """
         Fusión de referencia absoluta (GNSS o estación base).
-        Incluye test NIS 2D para detectar jamming/spoofing antes de aceptar el dato.
+        Incluye test NIS 2D con recuperación anti-secuestro para detectar jamming/spoofing
+        sin bloquearse permanentemente tras un salto legítimo de covarianza.
         """
         with self.lock:
             if not self.initialized:
@@ -149,9 +151,11 @@ class AethernetNavigator:
 
             S = H @ self.P @ H.T + R
             nis = float(y.T @ np.linalg.inv(S) @ y)
+            gate_2d = self.cfg.chi2_gate_2d if self.consecutive_gnss_rejects < 3 else 150.0
 
-            if nis > self.cfg.chi2_gate_2d:
+            if nis > gate_2d:
                 self.gnss_healthy = False
+                self.consecutive_gnss_rejects += 1
                 logging.warning(f"Nodo {self.node_id}: Anomalía GNSS/Spoofing detectada (NIS={nis:.2f}). Ignorando.")
                 return False
 
@@ -160,10 +164,15 @@ class AethernetNavigator:
             I_KH = np.eye(6) - K @ H
             self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
             self.gnss_healthy = True
+            self.consecutive_gnss_rejects = 0
             self.consecutive_rejects = 0
             return True
 
-    def update_peers_uwb_batch(self, peer_observations: List[Tuple[np.ndarray, np.ndarray, float]]) -> int:
+    def update_peers_uwb_batch(
+        self,
+        peer_observations: List[Tuple[np.ndarray, np.ndarray, float]],
+        return_rejected: bool = False
+    ) -> int:
         """
         Fusión cooperativa por lotes de todos los vecinos recibidos en la ventana actual.
         Aplica esquema Schmidt-Kalman (bloquea actualización de sesgo en medidas relativas)
@@ -174,6 +183,7 @@ class AethernetNavigator:
                 return 0
 
             valid_H, valid_y, valid_R = [], [], []
+            rejected = 0
             chi2_thresh = self.cfg.chi2_gate_1d if self.consecutive_rejects < 5 else 25.0
 
             for (peer_pos, peer_P_pos, measured_range_m) in peer_observations:
@@ -198,11 +208,13 @@ class AethernetNavigator:
                     valid_H.append(H_row)
                     valid_y.append(innov)
                     valid_R.append(r_eff)
+                else:
+                    rejected += 1
 
             m = len(valid_H)
             if m == 0:
                 self.consecutive_rejects += 1
-                return 0
+                return rejected if return_rejected else 0
 
             self.consecutive_rejects = 0
             H = np.array(valid_H)
@@ -216,7 +228,13 @@ class AethernetNavigator:
             self.x = self.x + K @ y
             I_KH = np.eye(6) - K @ H
             self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
-            return m
+            return rejected if return_rejected else m
+
+    def nees_2d(self, true_pos_xy: np.ndarray) -> float:
+        """Calcula Normalized Estimation Error Squared (NEES) 2D para validación estadística."""
+        with self.lock:
+            err = self.x[:2] - true_pos_xy
+            return float(err.T @ np.linalg.inv(self.P[:2, :2]) @ err)
 
     def pack_state_packet(self, range_to_target_m: float = 0.0) -> bytes:
         """Serializa estado y covarianza 2x2 en un paquete binario de 26 bytes."""
@@ -226,10 +244,11 @@ class AethernetNavigator:
             pxx = int(np.clip(self.P[0, 0] * 10000, -32767, 32767))
             pxy = int(np.clip(self.P[0, 1] * 10000, -32767, 32767))
             pyy = int(np.clip(self.P[1, 1] * 10000, -32767, 32767))
-            rng_mm = int(np.clip(range_to_target_m * 1000, 0, 32767))
+            # uint16 (0..65535 mm = hasta 65.535 m, cubre alcance completo DW3000)
+            rng_mm = int(np.clip(range_to_target_m * 1000, 0, 65535))
 
             payload = struct.pack(
-                '<2sBBIffhhh',
+                '<2sBBIffhhhH',
                 MAGIC_HEADER, self.node_id, flags, ts_ms,
                 float(self.x[0]), float(self.x[1]),
                 pxx, pxy, pyy, rng_mm
@@ -277,7 +296,7 @@ if __name__ == "__main__":
     drone_node = AethernetNavigator(node_id=2, is_static_anchor=False)
     drone_node.initialize_state(np.array([5.0, 0.0]), vel_xy=np.array([0.0, 1.0]), pos_std=0.4)
 
-    tx_packet = base_node.pack_state_packet(range_to_target_m=5.02)
+    tx_packet = base_node.pack_state_packet(range_to_target_m=34.85)
     assert len(tx_packet) == 26, "Tamaño de paquete incorrecto"
 
     t0 = time.time()
@@ -285,7 +304,8 @@ if __name__ == "__main__":
     drone_node.predict_imu(np.array([0.0, 0.0]), t0 + 0.1)
 
     parsed = AethernetNavigator.unpack_state_packet(tx_packet)
-    if parsed is not None:
-        accepted_cnt = drone_node.update_peers_uwb_batch([(parsed['pos'], parsed['P_pos'], parsed['range_m'])])
-        pos, vel, uncertainty = drone_node.get_telemetry()
-        logging.info(f"Fusión UWB aceptada={accepted_cnt} | Posición={pos.round(3)} | Incertidumbre 1-sigma={uncertainty:.3f} m")
+    assert parsed is not None and abs(parsed['range_m'] - 34.85) < 1e-3, "Error de escalado uint16 en rango"
+
+    accepted_cnt = drone_node.update_peers_uwb_batch([(parsed['pos'], parsed['P_pos'], 5.02)])
+    pos, vel, uncertainty = drone_node.get_telemetry()
+    logging.info(f"Fusión UWB aceptada={accepted_cnt} | Posición={pos.round(3)} | Incertidumbre 1-sigma={uncertainty:.3f} m")

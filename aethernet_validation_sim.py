@@ -1,8 +1,9 @@
 """
 AETHERNET - Suite de Simulación y Validación (SIL - Software-in-the-Loop)
 =========================================================================
-Arquitectura: EKF Cooperativo Descentralizado Jerárquico (Schmidt-EKF / Trust-Weighted)
-              + Protección anti-secuestro (Dynamic Chi-Square Gating) contra rebotes NLOS.
+Ejecuta directamente el motor de producción `AethernetNavigator` (`aethernet_core_node_6.py`)
+incluyendo serialización/deserialización binaria de 26 bytes con verificación CRC-16.
+
 Escenario: 1 Estación Base fija (coordenadas conocidas) + 1 Nodo Relé (GNSS intermitente)
            + 8 Nodos Tácticos en zona 100% GNSS-Denied.
 
@@ -12,9 +13,14 @@ Métricas validadas:
 3. Rechazo automático de outliers UWB (NLOS / Multipath) mediante gating Chi-cuadrado.
 """
 
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 
+from aethernet_core_node_6 import AethernetNavigator, EKFConfig
+
+# Silenciar logs de inicialización por nodo durante los benchmarks comparativos
+logging.getLogger().setLevel(logging.WARNING)
 np.random.seed(42)
 
 # --- 1. Parámetros Físicos y de Escenario ---
@@ -30,7 +36,7 @@ NLOS_OUTLIER_PROB = 0.05  # 5% de lecturas UWB con rebote NLOS (+3 a +8 m)
 # Ruido de sensores (basado en hardware comercial calibrado: BMI088 + DW3000)
 IMU_ACC_NOISE = 0.08      # m/s^2
 IMU_BIAS_INIT = 0.04      # m/s^2 (sesgo residual tras calibración estática)
-IMU_BIAS_WALK = 0.0005    # m/s^2 / sqrt(step)
+IMU_BIAS_WALK = 0.0005    # m/s^2 / sqrt(s)
 UWB_NOISE = 0.12          # m (ruido LOS)
 ANCHOR_POS_NOISE = 0.25   # m (precisión estación base / relé)
 ANCHOR_PERIOD = 5         # Actualización absoluta cada 0.5 s (2 Hz)
@@ -51,160 +57,29 @@ for i in range(1, NUM_NODES):
     r_orbit = 7.0 + 2.5 * (i % 2)
     omega = 0.15
     cx, cy = 10.0 + 3.0 * np.sin(0.05 * t), 8.0 + 3.0 * np.cos(0.05 * t)
-    
+
     true_pos[i, :, 0] = cx + r_orbit * np.cos(omega * t + phase)
     true_pos[i, :, 1] = cy + r_orbit * np.sin(omega * t + phase)
-    
+
     dcx = 3.0 * 0.05 * np.cos(0.05 * t)
     dcy = -3.0 * 0.05 * np.sin(0.05 * t)
     ddcx = -3.0 * (0.05**2) * np.sin(0.05 * t)
     ddcy = -3.0 * (0.05**2) * np.cos(0.05 * t)
-    
+
     true_vel[i, :, 0] = dcx - r_orbit * omega * np.sin(omega * t + phase)
     true_vel[i, :, 1] = dcy + r_orbit * omega * np.cos(omega * t + phase)
-    
+
     true_acc[i, :, 0] = ddcx - r_orbit * (omega**2) * np.cos(omega * t + phase)
     true_acc[i, :, 1] = ddcy - r_orbit * (omega**2) * np.sin(omega * t + phase)
 
-# --- 3. Estimador Descentralizado por Nodo (EKF Cooperativo Consistente) ---
-class DecentralizedNodeEKF:
-    """
-    Filtro de navegación local de 6 estados: [px, py, vx, vy, bax, bay].
-    Implementa:
-    - Predicción cinemática IMU.
-    - Fusión cooperativa por lotes estilo Schmidt-Kalman:
-      * Bloquea el cross-talk sobre los estados de sesgo (b_ax, b_ay) durante actualizaciones
-        relativas UWB para evitar divergencia por falta de observabilidad.
-      * Pondera la información de cada vecino según su jerarquía de confianza (traza de P_pos).
-    - Gating estadístico Chi-cuadrado con recuperación anti-secuestro.
-    """
-    def __init__(self, node_id, init_pos, init_vel, is_static_base=False):
-        self.id = node_id
-        self.is_static_base = is_static_base
-        self.x = np.hstack([init_pos, init_vel, [0.0, 0.0]])
-        self.consecutive_rejects = 0
-        
-        if is_static_base:
-            self.P = np.diag([1e-3, 1e-3, 1e-6, 1e-6, 1e-6, 1e-6])
-        else:
-            self.P = np.diag([0.5**2, 0.5**2, 0.2**2, 0.2**2, 0.04**2, 0.04**2])
+# --- 3. Instanciación del Motor Real (AethernetNavigator) por Escenario ---
+ekf_cfg = EKFConfig(
+    acc_noise_std=IMU_ACC_NOISE,
+    bias_residual_std=IMU_BIAS_INIT,
+    bias_walk_std=IMU_BIAS_WALK,
+    uwb_noise_std=UWB_NOISE
+)
 
-        self.F = np.array([
-            [1, 0, DT, 0, -0.5*DT**2, 0],
-            [0, 1, 0, DT, 0, -0.5*DT**2],
-            [0, 0, 1,  0, -DT,        0],
-            [0, 0, 0,  1,  0,        -DT],
-            [0, 0, 0,  0,  1,         0],
-            [0, 0, 0,  0,  0,         1]
-        ])
-        self.B = np.array([
-            [0.5*DT**2, 0],
-            [0, 0.5*DT**2],
-            [DT, 0],
-            [0, DT],
-            [0, 0],
-            [0, 0]
-        ])
-        # Ruido de proceso Q dimensionado para absorber el sesgo residual no observado
-        acc_eff_noise = np.sqrt(IMU_ACC_NOISE**2 + IMU_BIAS_INIT**2)
-        self.Q = np.diag([
-            1e-3, 1e-3,
-            (acc_eff_noise * DT)**2, (acc_eff_noise * DT)**2,
-            IMU_BIAS_WALK**2, IMU_BIAS_WALK**2
-        ])
-
-    def predict(self, acc_meas):
-        if self.is_static_base:
-            return
-        self.x = self.F @ self.x + self.B @ acc_meas
-        self.P = self.F @ self.P @ self.F.T + self.Q
-
-    def update_absolute_anchor(self, z_pos, r_std):
-        """Actualización de posición absoluta (Base o Relé con GNSS seguro)."""
-        H = np.zeros((2, 6))
-        H[0, 0] = 1.0
-        H[1, 1] = 1.0
-        R = np.eye(2) * (r_std**2)
-        y = z_pos - self.x[:2]
-        
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)
-        self.x = self.x + K @ y
-        I_KH = np.eye(6) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
-        self.consecutive_rejects = 0
-
-    def update_cooperative_batch(self, neighbor_observations):
-        """
-        Fusión cooperativa por lotes de las observaciones UWB recibidas en el ciclo.
-        """
-        if self.is_static_base or len(neighbor_observations) == 0:
-            return 0
-
-        valid_H = []
-        valid_y = []
-        valid_R = []
-        rejected = 0
-
-        # Umbral dinámico anti-secuestro: si llevamos varios rechazos seguidos, abrimos ventana
-        chi2_thresh = 9.0 if self.consecutive_rejects < 5 else 25.0
-
-        for (n_pos, n_P_pos, z_dist) in neighbor_observations:
-            diff = self.x[:2] - n_pos
-            pred_dist = np.linalg.norm(diff)
-            if pred_dist < 1e-4:
-                continue
-
-            u_ij = diff / pred_dist
-            H_row = np.zeros(6)
-            H_row[0] = u_ij[0]
-            H_row[1] = u_ij[1]
-
-            # Covarianza efectiva conservadora (absorbe la correlación desconocida con el vecino)
-            r_neighbor = float(u_ij @ n_P_pos @ u_ij.T)
-            r_eff = (UWB_NOISE**2) + 4.0 * r_neighbor
-
-            innov = z_dist - pred_dist
-            S_1d = float(H_row @ self.P @ H_row.T) + r_eff
-            nis = (innov**2) / S_1d
-
-            if nis > chi2_thresh:
-                rejected += 1
-                continue
-
-            valid_H.append(H_row)
-            valid_y.append(innov)
-            valid_R.append(r_eff)
-
-        m = len(valid_H)
-        if m == 0:
-            self.consecutive_rejects += 1
-            return rejected
-
-        self.consecutive_rejects = 0
-        H = np.array(valid_H)
-        y = np.array(valid_y)
-        # Factor de correlación de lote para mantener consistencia estadística (NEES ~ 2)
-        R = np.diag(valid_R) * max(1.0, 0.8 * m)
-
-        S = H @ self.P @ H.T + R
-        K = self.P @ H.T @ np.linalg.inv(S)
-
-        # Esquema Schmidt-Kalman: anular ganancia sobre los estados de sesgo (indices 4, 5)
-        # cuando la medida es puramente relativa, evitando que el ruido de rango corrompa el sesgo IMU.
-        K[4:, :] = 0.0
-
-        self.x = self.x + K @ y
-        I_KH = np.eye(6) - K @ H
-        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
-        return rejected
-
-    def nees(self, true_p):
-        err = self.x[:2] - true_p
-        return float(err.T @ np.linalg.inv(self.P[:2, :2]) @ err)
-
-
-# --- 4. Ejecución de Escenarios Comparativos ---
 modes = ['IMU Only', 'IMU + UWB (Sin Anclas)', 'AETHERNET (Descentralizado)']
 results_pos = {m: np.zeros((NUM_NODES, STEPS, 2)) for m in modes}
 results_nees = {m: np.zeros(STEPS) for m in modes}
@@ -218,20 +93,25 @@ init_err_v[0] = 0.0
 
 swarms = {}
 for m in modes:
-    swarms[m] = [
-        DecentralizedNodeEKF(
-            i,
-            true_pos[i, 0] + init_err_p[i],
-            true_vel[i, 0] + init_err_v[i],
-            is_static_base=(i == 0)
-        )
-        for i in range(NUM_NODES)
-    ]
+    swarms[m] = []
     for i in range(NUM_NODES):
-        results_pos[m][i, 0] = swarms[m][i].x[:2]
+        is_base = (i == 0)
+        nav = AethernetNavigator(node_id=i, is_static_anchor=is_base, config=ekf_cfg)
+        nav.initialize_state(
+            pos_xy=true_pos[i, 0] + init_err_p[i],
+            vel_xy=true_vel[i, 0] + init_err_v[i],
+            pos_std=0.03 if is_base else 0.5
+        )
+        # Sincronizar reloj inicial del filtro con t = 0.0
+        nav.predict_imu(np.zeros(2), timestamp=0.0)
+        swarms[m].append(nav)
+        results_pos[m][i, 0] = nav.x[:2]
 
+# --- 4. Bucle Principal de Simulación SIL ---
 for step in range(1, STEPS):
-    true_bias += np.random.randn(NUM_NODES, 2) * IMU_BIAS_WALK
+    now = step * DT
+    # Random walk continuo escalado correctamente con sqrt(DT)
+    true_bias += np.random.randn(NUM_NODES, 2) * (IMU_BIAS_WALK * np.sqrt(DT))
     acc_meas = true_acc[:, step] + true_bias + np.random.randn(NUM_NODES, 2) * IMU_ACC_NOISE
 
     uwb_links = []
@@ -242,7 +122,7 @@ for step in range(1, STEPS):
                 noise = np.random.randn() * UWB_NOISE
                 if np.random.rand() < NLOS_OUTLIER_PROB:
                     noise += np.random.uniform(3.0, 8.0)  # Rebote NLOS
-                uwb_links.append((i, j, d_true + noise))
+                uwb_links.append((i, j, float(d_true + noise)))
 
     anchor_tick = (step % ANCHOR_PERIOD == 0)
     relay_pos_meas = true_pos[1, step] + np.random.randn(2) * ANCHOR_POS_NOISE
@@ -250,29 +130,36 @@ for step in range(1, STEPS):
     for m in modes:
         nodes = swarms[m]
         for i in range(NUM_NODES):
-            nodes[i].predict(acc_meas[i])
+            nodes[i].predict_imu(acc_meas[i], timestamp=now)
 
         if 'AETHERNET' in m and anchor_tick:
-            nodes[0].update_absolute_anchor(np.array([0.0, 0.0]), 0.03)
-            nodes[1].update_absolute_anchor(relay_pos_meas, ANCHOR_POS_NOISE)
+            nodes[0].update_gnss_or_anchor(np.array([0.0, 0.0]), 0.03)
+            nodes[1].update_gnss_or_anchor(relay_pos_meas, ANCHOR_POS_NOISE)
 
         if 'UWB' in m or 'AETHERNET' in m:
-            broadcast = [(n.x[:2].copy(), n.P[:2, :2].copy()) for n in nodes]
+            # Simulación fiel del enlace radio: cada nodo empaqueta 26 bytes y el receptor valida CRC16
+            raw_packets = [n.pack_state_packet() for n in nodes]
+            decoded_peers = [AethernetNavigator.unpack_state_packet(pkt) for pkt in raw_packets]
+
             inbox = {i: [] for i in range(NUM_NODES)}
             for (i, j, z_d) in uwb_links:
-                inbox[i].append((broadcast[j][0], broadcast[j][1], z_d))
-                inbox[j].append((broadcast[i][0], broadcast[i][1], z_d))
+                pkt_j = decoded_peers[j]
+                pkt_i = decoded_peers[i]
+                if pkt_j is not None:
+                    inbox[i].append((pkt_j['pos'], pkt_j['P_pos'], z_d))
+                if pkt_i is not None:
+                    inbox[j].append((pkt_i['pos'], pkt_i['P_pos'], z_d))
                 if m == 'AETHERNET (Descentralizado)':
                     total_uwb_packets += 2
 
             for i in range(NUM_NODES):
-                rej = nodes[i].update_cooperative_batch(inbox[i])
+                rej = nodes[i].update_peers_uwb_batch(inbox[i], return_rejected=True)
                 if m == 'AETHERNET (Descentralizado)':
                     rejected_outliers += rej
 
         for i in range(NUM_NODES):
             results_pos[m][i, step] = nodes[i].x[:2]
-        results_nees[m][step] = np.mean([nodes[i].nees(true_pos[i, step]) for i in range(2, NUM_NODES)])
+        results_nees[m][step] = np.mean([nodes[i].nees_2d(true_pos[i, step]) for i in range(2, NUM_NODES)])
 
 # --- 5. Informe de Validación y Gráficas ---
 print("=== INFORME DE VALIDACIÓN SIL - AETHERNET ===")

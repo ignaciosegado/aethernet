@@ -1,48 +1,49 @@
-# AETHERNET — Decentralized Cooperative Navigation in GNSS-Denied Environments
+# AETHERNET
 
-> **Status:** Active R&D Prototype (Hardware-Decoupled Core & SIL Validation Suite)  
-> **Stack:** Python 3.11 · NumPy · Matplotlib · Binary Wire Protocol (`struct` + CRC-16)
+Decentralized cooperative navigation for GNSS-denied UAV swarms: a 6-state EKF per node (position, velocity,
+body-frame accelerometer bias), 3-D UWB ranging to fixed surveyed anchors and to peers, and an authenticated
+32-byte state broadcast. **Research prototype: validated in simulation under model mismatch, not on hardware.**
 
-A lightweight, decentralized state-estimation engine for multi-agent UAV swarms operating in GNSS-denied or RF-contested environments. Rather than relying on centralized servers, heavy computer vision, or continuous satellite fixes, **AETHERNET** fuses local high-rate **IMU kinematics**, peer-to-peer **Ultra-Wideband (UWB) ranging**, and **intermittent absolute anchor/relay updates** using a consistency-preserving Schmidt-Kalman Extended Kalman Filter (EKF).
+## Status
+| Claim | Evidence |
+|---|---|
+| Runs without the v1 defects (deadlock, covariance clipping, silent IMU-gap drop, gate widening, rate-dependent Q) | 36 unit/regression tests |
+| Packets authenticated, replay-protected, never over-confident | exhaustive bit-flip, forgery, replay, fuzz tests |
+| Accuracy and consistency under realistic mismatch | Monte Carlo, 10-20 held-out scenarios per suite: [docs/RESULTS.md](docs/RESULTS.md) |
+| Works on real hardware | **Not yet.** See [docs/HARDWARE.md](docs/HARDWARE.md) |
 
----
+## Headline results (20 held-out scenarios, 120 s, 8 GNSS-denied nodes, simulator != filter model)
+| | RMSE (m) | relative (pairwise) RMSE (m) | median NEES (ideal 1.39) | % NEES > 13.8 (ideal 0.1 %) |
+|---|---|---|---|---|
+| IMU only | 130 | 176 | 0.86 | 0 % |
+| v1 (original, shipped defaults) | 199 ± 123 | 273 | 474 | 91 % |
+| **v2** | **1.52 ± 0.34** | **0.98 ± 0.18** | **1.40** | **6.6 %** |
 
-## 1. Core Architectural Principles
+Honest reading: v2's *typical* consistency is right, its *tails* are still optimistic (6.6 % vs 0.1 %).
+Without any fixed anchor the swarm still holds its shape (3.6 m relative error) but drifts as a rigid body
+(21 m absolute after the relay loses GNSS): range-only networks cannot observe common translation/rotation.
+A GNSS drag spoof on the relay is bounded, not eliminated (worst relay error 12.9 m in 10 runs).
+v1 diverges here largely because the simulator is harsher than v1's implicit model; it is a fair statement of
+"v1 under realistic mismatch", not a like-for-like tuned comparison.
 
-* **Purely Relational & Decentralized:** Every node maintains its own local 6-state filter $\mathbf{x} = [p_x, p_y, v_x, v_y, b_{ax}, b_{ay}]^\top$. No central fusion server or global map is required.
-* **Schmidt-Kalman Bias Decoupling:** Relative range measurements between moving peers lack full observability of local accelerometer biases $(b_{ax}, b_{ay})$. During cooperative UWB updates, the Kalman gain rows corresponding to bias states are zeroed ($K_{4:, :} = 0$), preventing range noise or collinear swarm geometries from corrupting inertial bias estimates.
-* **Hierarchical Trust & Covariance Inflation:** Peer state broadcasts include their $2 \times 2$ position covariance submatrix $P_{\text{pos}}$. Receiving nodes inflate neighbor uncertainty along the line-of-sight unit vector $\mathbf{u}_{ij}$ to absorb unknown cross-correlations between agents.
-* **Anti-Hijack $\chi^2$ Gating (NIS):** Both 1D UWB range innovations and 2D intermittent GNSS/anchor updates are gated via Normalized Innovation Squared (NIS) thresholds to reject Non-Line-of-Sight (NLOS) multipath spikes and GNSS spoofing, featuring an adaptive recovery window after consecutive rejections[cite: 33, 34].
-* **Low-Bandwidth Binary Telemetry (26 Bytes/Packet):** Custom little-endian wire format (`AE` magic header, node ID, status flags, millisecond timestamp, float32 position, quantized covariance terms, UWB range, and CRC-16-CCITT checksum) designed for constrained UWB/RF tactical links.
+## Install / use
+```bash
+pip install -e ".[dev]"
+pytest -q
+python examples/quickstart.py
+python -m aethernet.sim.mc --quick            # simulation suite (full: ~30 min on one core)
+python -m aethernet.replay my_run.jsonl       # score a real log: prints NIS consistency verdict
+```
 
----
+## Layout
+`src/aethernet/` estimator, protocol, config, replay, sim/ | `tests/` | `docs/` design, threat model, hardware plan, results |
+`legacy/` unmodified v1 (the baseline) | `examples/`
 
-## 2. System Dataflow
+## What changed from v1
+See [CHANGELOG.md](CHANGELOG.md) and [docs/DESIGN.md](docs/DESIGN.md) (including approaches that failed).
 
-```text
-+-----------------------+       +-------------------------+       +-----------------------+
-|   Local IMU / AHRS    |       |  Peer UWB Broadcasts    |       |  Intermittent Anchor  |
-|  (50–200 Hz Accel)    |       | (26B Binary Packet +    |       |  or Relay GNSS Fix    |
-|                       |       |  Two-Way Ranging)       |       |      (1–2 Hz)         |
-+-----------+-----------+       +------------+------------+       +-----------+-----------+
-            |                                |                                |
-            v                                v                                v
-+-----------------------+       +-------------------------+       +-----------------------+
-|   EKF Time Update     |       |  1D NIS Chi-Square Gate |       |  2D NIS Spoof Gate    |
-|  (State & Covariance  |       |  + Covariance Inflation |       |  (Absolute Position   |
-|     Propagation)      |       |  + Schmidt Bias Lock    |       |      Correction)      |
-+-----------+-----------+       +------------+------------+       +-----------+-----------+
-            |                                |                                |
-            +--------------------------------+--------------------------------+
-                                             |
-                                             v
-                            +---------------------------------+
-                            |   Local 6-DOF Kinematic State   |
-                            |  [px, py, vx, vy, bax, bay] & P |
-                            +----------------+----------------+
-                                             |
-                                             v
-                            +---------------------------------+
-                            |  26-Byte CRC16 Packet Encoder   |
-                            |  (Broadcast to Neighbor Nodes)  |
-                            +---------------------------------+
+## Known limits
+Planar filter with aided altitude; shared mission frame and consistent yaw required; no clock model; pre-shared-key
+authentication does not stop a compromised member; the information-decorrelation factor (`ranging_rate_hz *
+peer_error_coherence_s`) is a physically-motivated heuristic with a sensitivity cliff (see DESIGN.md); results are
+simulation-only. Parameters were tuned on dev seeds 0-9; reported seeds (200+) were not used for tuning.

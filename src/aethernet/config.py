@@ -49,6 +49,9 @@ class EKFConfig:
     gate_prob_range: float = 0.999
     gate_prob_gnss: float = 0.999
     huber_k: float = 2.0                 # normalized-innovation level where R starts being inflated (Huber)
+    nlos_ewma_beta: float = 0.85         # memory factor for per-peer sustained NLOS detection
+    nlos_ewma_thresh: float = 6.0        # reject link only when sustained positive bias is unambiguous
+    nlos_pos_gate_prob: float = 0.995    # single-step gate (7.88) for positive (NLOS-delayed) innovations
     gate_streak_batches: int = 5         # >= this many consecutive ranging epochs with >=50% of links gated ...
     gate_streak_inflate: float = 1.6     # ... => inflate pos/vel covariance by this factor per epoch (range evidence only)
     gate_streak_max_var: float = 400.0   # m^2 cap on position variance the inflation may reach
@@ -72,12 +75,14 @@ class EKFConfig:
         if self.mobile_peer_mode not in ("ci", "kf"):
             raise ValueError("mobile_peer_mode must be 'ci' or 'kf'")
         if self.freeze_bias_on_range and self.mobile_peer_mode == "ci":
-            # CI inflates the whole prior by 1/w; with the bias gain zeroed that inflation never gets informed
-            # and the bias covariance diverges exponentially (found in simulation).  Schmidt only with KF updates.
             raise ValueError("freeze_bias_on_range requires mobile_peer_mode='kf'")
-        for k in ("gate_prob_range", "gate_prob_gnss"):
+        for k in ("gate_prob_range", "gate_prob_gnss", "nlos_pos_gate_prob"):
             if not 0.5 < getattr(self, k) < 1.0:
                 raise ValueError(f"{k} must be in (0.5, 1)")
+        if not 0.0 <= self.nlos_ewma_beta < 1.0:
+            raise ValueError("nlos_ewma_beta must be in [0, 1)")
+        if self.nlos_ewma_thresh <= 0.0:
+            raise ValueError("nlos_ewma_thresh must be > 0")
         return self
 
     def with_(self, **kw) -> "EKFConfig":
@@ -85,12 +90,7 @@ class EKFConfig:
 
     @property
     def peer_kappa(self) -> float:
-        """Information-decorrelation factor for mobile peers.
-
-        N ranges to the same peer within its error-coherence time share one realisation of that peer's position
-        error, so only ~1 of them is independent.  Inflating the peer-uncertainty term of R by N = rate * coherence
-        stops the filter from "averaging down" a persistent error (the echo-chamber failure of naive cooperative
-        EKFs).  The white UWB noise term is NOT inflated, so relative accuracy is preserved."""
+        """Information-decorrelation factor for mobile peers."""
         return max(1.0, self.ranging_rate_hz * self.peer_error_coherence_s)
 
     @property

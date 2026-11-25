@@ -3,14 +3,6 @@
 State  x = [px, py, vx, vy, bx, by]   (mission frame, metres; b = accel bias in the *body* horizontal frame
                                        when a yaw is supplied to ``predict``, else in the world frame)
 Aiding altitude is an input (baro/rangefinder), not a state: ranges are 3-D slant ranges.
-
-Design rules (see docs/DESIGN.md):
-  * Process noise comes from continuous-time densities (rate independent, correct pos/vel cross-covariance).
-  * Fixed surveyed anchors  -> classical EKF update (independent, known position).
-  * Mobile peers            -> Covariance Intersection update (consistent under *unknown* cross-correlation).
-  * No gate widening. Persistent inconsistency is handled by range-consensus displacement detection,
-    which relies on physical ranges, so a GNSS spoofer cannot trigger it.
-  * One RLock; no logging or allocation-heavy work inside the hot path beyond small numpy ops.
 """
 from __future__ import annotations
 
@@ -60,9 +52,11 @@ class Navigator:
         self._disp_votes = 0
         self._disp_last = np.zeros(2)
         self._gate_streak = 0
+        self._peer_ewma_nis: Dict[int, float] = {}
 
         c = self.cfg
         self._gate1 = chi2_gate(c.gate_prob_range, 1)
+        self._gate1_pos = chi2_gate(c.nlos_pos_gate_prob, 1)
         self._gate2 = chi2_gate(c.gate_prob_gnss, 2)
 
     # ------------------------------------------------------------------ init
@@ -80,6 +74,7 @@ class Navigator:
         self.P = np.diag([pos_std ** 2, pos_std ** 2, v_std ** 2, v_std ** 2, b_std ** 2, b_std ** 2])
         if alt is not None:
             self.alt = float(alt)
+        self._peer_ewma_nis.clear()
         self.initialized = True
 
     def set_altitude(self, alt: float, std: Optional[float] = None) -> None:
@@ -90,12 +85,7 @@ class Navigator:
 
     # --------------------------------------------------------------- predict
     def predict(self, acc_world_xy, t: float, yaw: Optional[float] = None) -> None:
-        """Propagate with a gravity-compensated world-frame horizontal acceleration (from the AHRS).
-
-        If ``yaw`` (rad, same frame as the acceleration) is given the accel bias is modelled in the body
-        frame and rotated into the world frame, which is the physically correct behaviour for a turning
-        vehicle.  ``t`` must be a monotonic clock (``time.monotonic()``).
-        """
+        """Propagate with a gravity-compensated world-frame horizontal acceleration (from the AHRS)."""
         with self._lock:
             self._now = t
             if not self.initialized or self.is_static_anchor:
@@ -106,7 +96,7 @@ class Navigator:
                 return
             dt = t - self._last_t
             if dt <= 0.0:
-                self.diag.stale_imu += 1          # out-of-order / duplicate sample: ignore, keep clock
+                self.diag.stale_imu += 1
                 return
             self._last_t = t
             a = np.asarray(acc_world_xy, float)
@@ -114,7 +104,7 @@ class Navigator:
             if gap:
                 self.diag.gaps += 1
                 self._last_gap_t = t
-                a_used = self._last_acc            # hold last known accel over the gap
+                a_used = self._last_acc
             else:
                 a_used = a
             self._last_acc = a
@@ -143,7 +133,7 @@ class Navigator:
                 Q[k + 2, k + 2] = q * dt
                 Q[k, k + 2] = Q[k + 2, k] = q * dt2 / 2.0
                 Q[k + 4, k + 4] = qb * dt
-            if gap:                                  # unknown accel over the gap: inflate, never silently skip
+            if gap:
                 g2 = self.cfg.gap_acc_std ** 2
                 for k in (0, 1):
                     Q[k, k] += g2 * dt2 * dt2 / 4.0
@@ -156,11 +146,7 @@ class Navigator:
 
     # ------------------------------------------------------------- absolute
     def update_gnss(self, pos_xy, std: float) -> bool:
-        """2-D absolute position (GNSS / surveyed fix). Plain NIS gate; the gate is NEVER widened.
-
-        A fix the filter keeps rejecting stays rejected while the filter is anchored by ranges.  If the
-        filter really is displaced, ``update_ranges`` detects it from physical ranges and re-centres it.
-        """
+        """2-D absolute position (GNSS / surveyed fix). Plain NIS gate; the gate is NEVER widened."""
         with self._lock:
             z = np.asarray(pos_xy, float)
             if not self.initialized:
@@ -211,7 +197,7 @@ class Navigator:
                     rep.recovered = self._try_consensus(gated_items)
                 if (not rep.recovered and self._gate_streak >= self.cfg.gate_streak_batches
                         and self.P[0, 0] + self.P[1, 1] < self.cfg.gate_streak_max_var):
-                    f = self.cfg.gate_streak_inflate    # range-evidence-driven inflation (never triggered by GNSS)
+                    f = self.cfg.gate_streak_inflate
                     self.P[:4, :4] *= f
                     self.P[:4, 4:] *= math.sqrt(f)
                     self.P[4:, :4] *= math.sqrt(f)
@@ -233,7 +219,7 @@ class Navigator:
         if age > c.peer_max_age or age < -c.peer_max_age or not math.isfinite(o.range_m) or o.range_m <= 0.0:
             rep.skipped += 1
             return
-        if a_info is not None:                                   # surveyed anchor: trust the table, not the air
+        if a_info is not None:
             pp = np.array([a_info.x, a_info.y])
             Pj = np.eye(2) * (a_info.std ** 2 + c.anchor_extra_std ** 2)
             pz, pz_std = a_info.z, 0.05
@@ -262,12 +248,22 @@ class Navigator:
         s = float(h @ Ph)
         S = s + r
         nis = y * y / S
-        if nis > self._gate1:
+
+        # Sustained positive range bias detector (negative innovations decay EWMA to 0)
+        beta = c.nlos_ewma_beta
+        prev_ewma = self._peer_ewma_nis.get(o.peer_id, 0.0)
+        nis_pos = nis if y > 0.0 else 0.0
+        ewma_nis = beta * prev_ewma + (1.0 - beta) * nis_pos
+        self._peer_ewma_nis[o.peer_id] = ewma_nis
+
+        single_gate = self._gate1_pos if y > 0.0 else self._gate1
+        if nis > single_gate or ewma_nis > c.nlos_ewma_thresh:
             rep.gated += 1
             gated_items.append((pp, dz, o.range_m, r))
             return
+
         e = math.sqrt(nis)
-        if e > c.huber_k:                                        # Huber: down-weight, don't discard
+        if e > c.huber_k:
             r *= e / c.huber_k
         self.nis_log.append(nis)
 
@@ -292,30 +288,17 @@ class Navigator:
         rep.accepted += 1
 
     def _ci_omega(self, Ph: np.ndarray, s: float, r: float) -> float:
-        """Marginal-CI weight minimising the posterior position-variance trace.
-
-        Full-state CI (P/w) re-inflates *every* direction on every scalar update; applied ~80x/s it blows the
-        filter up (found in simulation, see docs/DESIGN.md).  Here the unknown cross-correlation is bounded only
-        along the measured direction h:   P' = P + (1/w - 1) P h h' P / s ,   r' = r/(1-w).
-        Resulting update:  K = P h /(s + w r/(1-w)),  P+ = P + [ (1-w)/(w s) - 1/(w^2 S') ] P h h' P,
-        S' = s/w + r/(1-w).  Returns 1.0 when no w reduces the position-variance trace.
-        """
         w = _OMEGA
         Sp = s / w + r / (1.0 - w)
         coef = (1.0 - w) / (w * s) - 1.0 / (w * w * Sp)
         p2 = float(Ph[0] * Ph[0] + Ph[1] * Ph[1])
-        d = coef * p2                                   # change of position-variance trace (negative = gain)
+        d = coef * p2
         k = int(np.argmin(d))
         tr0 = float(self.P[0, 0] + self.P[1, 1])
         return float(w[k]) if d[k] < -1e-4 * tr0 else 1.0
 
     # ------------------------------------------------- displacement recovery
     def _try_consensus(self, items: list) -> bool:
-        """>=3 gated links *jointly* explained by one position (nonlinear LS) => this filter is displaced.
-
-        Single-link NLOS spikes are inconsistent with each other and never pass the fit test; a GNSS spoofer
-        cannot trigger it either because only physical ranges are used.
-        """
         c = self.cfg
         PP = np.array([it[0] for it in items])
         DZ = np.array([it[1] for it in items])
@@ -327,7 +310,7 @@ class Navigator:
             rho = np.maximum(np.sqrt(np.sum(d * d, axis=1) + DZ * DZ), 1e-6)
             J = d / rho[:, None]
             A = J.T @ (J * W[:, None])
-            if np.linalg.cond(A) > 1e3:                      # collinear geometry: position not observable
+            if np.linalg.cond(A) > 1e3:
                 self._disp_votes = 0
                 return False
             step = np.linalg.solve(A, J.T @ (W * (Z - rho)))
@@ -356,6 +339,7 @@ class Navigator:
         self.P[:2, :2] += np.outer(delta, delta) + Cd
         self.P = 0.5 * (self.P + self.P.T)
         self._disp_votes = 0
+        self._peer_ewma_nis.clear()
         self.diag.recoveries += 1
         log.warning("node %d: displacement recovery, shift=%s", self.node_id, np.round(delta, 2))
         return True
@@ -378,8 +362,6 @@ class Navigator:
         return s.pos, s.vel, float(math.sqrt(max(0.0, s.P_pos[0, 0] + s.P_pos[1, 1])))
 
     def nis_consistency(self, min_n: int = 50):
-        """Mean normalized innovation squared of accepted updates (expected ~1). Needs no ground truth.
-        Returns (mean, lo, hi, n); lo/hi are ~95% bounds under a Gaussian approximation. None if too few samples."""
         with self._lock:
             n = len(self.nis_log)
             if n < min_n:
@@ -387,4 +369,3 @@ class Navigator:
             m = float(np.mean(self.nis_log))
             sd = math.sqrt(2.0 / n)
             return m, 1.0 - 1.96 * sd, 1.0 + 1.96 * sd, n
-

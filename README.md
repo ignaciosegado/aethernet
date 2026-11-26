@@ -1,51 +1,46 @@
 # AETHERNET
 
-**GNSS-denied, cooperative UWB + inertial navigation stack for multi-UAV swarms.**
+**Cooperative Relative Navigation & Anti-Spoofing Fusion SDK for Multi-Agent Operations**
 
-AETHERNET fuses continuous-time strapdown IMU propagation, barometric/rangefinder altitude aiding, surveyed stationary UWB anchors, and peer-to-peer UWB ranging over an authenticated 32-byte binary wire protocol—without requiring GNSS, visual odometry, or external motion capture during flight.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](#installation)
 
----
+AETHERNET is a lightweight state-estimation and wire-framing library designed to extend a trusted coordinate frame from a **mobile or local host** (vessel, USV, ground vehicle, or lead relay node) across a multi-drone team when GNSS is jammed or spoofed and visual odometry degrades due to darkness, sea spray, dust, or structural occlusion.
 
-## Core Architecture (`v2`)
-
-* **6-State Error-State / Extended Kalman Filter (`src/aethernet/estimator.py`):** Tracks 2-D mission-frame position, velocity, and body-frame horizontal accelerometer bias (`[px, py, vx, vy, bx, by]`) with 3-D slant-range projection against altitude aiding.
-* **Continuous-Time Process Noise (`src/aethernet/config.py`):** Parameterized by physical spectral densities (`acc_noise_density`, `bias_walk_density`, `acc_unmodeled_std/tau`) so covariance propagation remains rate-independent across varying IMU frequencies and gracefully inflates across telemetry gaps.
-* **Consistent Multi-Node Fusion:**
-  * **Surveyed Anchors:** Classical EKF updates with survey variance folded into measurement noise.
-  * **Mobile Peers:** Marginal Covariance Intersection (CI) and coherence-time information decorrelation (`peer_kappa`) to prevent cross-correlation echo-chamber overconfidence when peers exchange repeated ranges.
-* **Asymmetric Per-Peer EWMA NLOS Gating & Range-Consensus Recovery:**
-  * Combines Huber measurement down-weighting with an asymmetric positive-innovation gate and a per-link Exponentially Weighted Moving Average (EWMA) NIS tracker (`nlos_ewma_beta`, `nlos_ewma_thresh`) to reject sustained wall reflections while decaying cleanly back to zero on line-of-sight recovery.
-  * Multi-link nonlinear least-squares consensus (`_try_consensus`) detects and recovers from genuine filter displacement using physical ranges alone—immune to GNSS spoofing.
-* **Authenticated 32-Byte Wire Protocol (`src/aethernet/protocol.py`):** Compact binary state broadcast packets protected by truncated HMAC-SHA256 authentication and sliding-window anti-replay filtering.
+Rather than competing with infrastructure-free visual-inertial odometry (VIO) in open-sky flight, AETHERNET acts as a **cooperative ranging-fusion and anti-spoofing layer** that fuses inertial propagation with peer-to-peer UWB slant ranges—allowing occluded relay nodes with **zero direct host line-of-sight** and **zero GNSS** to maintain bounded relative positioning without covariance collapse.
 
 ---
 
-## Validation Status
+## Core Capabilities
 
-* **Unit & Simulation Suite (`pytest`):** Verified across deterministic Monte Carlo scenarios covering IMU dropouts, GNSS spoofing rejection, cooperative peer anchor-sharing, and sustained NLOS multipath.
-* **Physical Flight Hardware Logs (`NTU VIRAL`):** Validated on real-world UAV flight logs (VectorNav VN-100 IMU, Humatics P440 UWB radios, Leica MS60 laser-tracker ground truth) across outdoor courtyard (`eee_01`), indoor auditorium (`nya_01`), and building-canyon (`sbs_01`) environments. Custom embedded flight hardware integration is in progress.
-
-### Hardware Replay Summary (`NTU VIRAL`)
-
-| Sequence | Environment | Accepted / Gated Ranges | NIS Mean (`0.84–1.16` 95% band) | Position RMSE | p95 Error |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **`eee_01`** | Outdoor courtyard / building exterior | `17,223` / `2,222` | `0.97` (`CONSISTENT`) | **0.51 m** | **0.78 m** |
-| **`nya_01`** | Indoor steel/concrete auditorium (heavy multipath) | `15,424` / `2,969` | `1.50` (unmodeled lever-arm/NLOS spread) | **2.09 m** | **5.06 m** |
-| **`sbs_01`** | Multi-building canyon (facade reflections) | `13,187` / `1,873` | `3.21` (facade NLOS + partial occlusion) | **2.94 m** | **7.89 m** |
-
-Full benchmark methodology, ablation comparisons, and hardware scope caveats are documented in [`docs/RESULTS.md`](docs/RESULTS.md).
-
-
-### Key Finding
-Cooperative airborne relay reduces blackout position RMSE by **95.8%** (`71.57 m` $\rightarrow$ `3.01 m`). While naive cooperative Kalman fusion (`kf`) suffers severe covariance collapse (`Mean NEES = 23.53`) due to unmodeled cross-correlation across repeated peer updates, Marginal Covariance Intersection (`ci`) preserves both sub-3.1 m accuracy and statistical covariance consistency (`Mean NEES = 1.87`).
+* **Marginal Covariance Intersection (`Navigator`, `mobile_peer_mode="ci"`):** Optimizes the convex fusion weight $\omega \in (0, 1)$ minimizing $\operatorname{tr}(\mathbf{P}_{\text{fused}})$ alongside coherence-time decorrelation (`peer_error_coherence_s`) to fuse uncertain mobile-peer positions without double-counting correlated trajectory errors.
+* **Asymmetric Multipath & Spoofing Defense:** Combines per-peer EWMA NLOS gating (`nlos_ewma_beta`, `nlos_ewma_thresh`) against positive range bias with geometric range-consensus cross-checks (`_try_consensus` / Mahalanobis arbitration) to reject gradual GNSS position-ramp spoofing.
+* **32-Byte Authenticated Binary Protocol (`Codec`):** Packs node position, velocity, altitude, uncertainty bounds, sequence counter, and truncated HMAC-SHA256 authentication into 32 bytes (`~2.5 kbps` at `10 Hz`) for low-bandwidth RF and telemetry links.
+* **Drop-In Flight-Stack Integration:** Outputs covariance-calibrated state snapshots compatible with standard MAVLink external vision aiding (`VISION_POSITION_ESTIMATE` / `ODOMETRY`) on PX4 and ArduPilot without requiring hardware modifications to host mast infrastructure.
 
 ---
 
-## Quickstart
+## Repository Layout
 
-### Installation
-
-```bash
-pip install -e .
-# Optional (for converting ROS1 NTU VIRAL .bag logs):
-pip install rosbags
+```text
+aethernet/
+├── .github/workflows/       # Automated unit and filter-consistency CI
+├── configs/
+│   └── eee_cal.json         # Frozen out-of-sample anchor calibration learned on eee_01
+├── data/                    # Place downloaded NTU VIRAL .bag files here (git-ignored)
+├── docs/
+│   └── RESULTS.md           # Full out-of-sample & 20-seed benchmark methodology and tables
+├── examples/                # Minimal runnable estimation and wire-codec examples
+├── logs/                    # Generated .jsonl replay logs (git-ignored)
+├── scripts/
+│   ├── calibrate_split.py   # Strict train/test calibration split (eee_01 -> blind eee_02/03)
+│   ├── convert_ntu_viral.py # ROS1 bag -> JSONL event stream converter
+│   ├── coop_ntu_viral.py    # Multi-seed semi-synthetic cooperative replay benchmark
+│   └── replay.py            # Single-node physical sensor replay evaluator
+├── src/aethernet/           # Core Navigator, Codec, EKFConfig, and data structures
+├── tests/                   # Unit, wire-codec, and covariance-consistency tests
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── LICENSE                  # Apache License 2.0
+├── NOTICE                   # Trademark and third-party attribution notice
+└── pyproject.toml

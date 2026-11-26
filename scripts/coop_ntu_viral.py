@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""v2.2 Multi-Vehicle Cooperative Hardware Replay (0-Anchor Isolation on Node 1).
+"""v2.2 Semi-Synthetic Cooperative Replay on NTU VIRAL Logs (Leakage-Free Multi-Seed Benchmark).
 
-Pairs three real NTU VIRAL flight logs recorded in the same arena (e.g. eee_01, eee_02, eee_03)
-in their shared Leica mission frame. During the blackout window (or the entire flight with
---full-blackout), Node 1 has 0 ground UWB anchors and 0 GNSS, localizing purely via peer-to-peer
-UWB ranges and authenticated 32-byte Codec telemetry packets from airborne helpers Node 2 & Node 3.
+Replays eee_01, eee_02, and eee_03 in their shared Leica courtyard frame. During the blackout
+window, Node 1 has 0 ground UWB anchors and 0 valid GNSS (or receives a slow GNSS spoofing ramp)
+and localizes via peer-to-peer UWB slant ranges + authenticated 32-byte Codec telemetry from
+airborne helpers Node 2 and Node 3.
 
-Usage:
-    python scripts/coop_ntu_viral.py --log1 logs/eee_01.jsonl --log2 logs/eee_02.jsonl --log3 logs/eee_03.jsonl
+Baselines & Estimators Compared:
+  1. solo     : 0 ground anchors, 0 peers during blackout (pure IMU / spoofed-GNSS baseline)
+  2. uwb_wls  : Epoch-by-epoch Gauss-Newton 2D UWB trilateration on peer ranges only (no IMU)
+  3. kf_k1    : Naive cooperative EKF without coherence decorrelation (kappa = 1)
+  4. kf_k200  : Decorrelated cooperative EKF (peer_error_coherence_s = 20.0 -> kappa = 200)
+  5. ci       : AETHERNET Marginal Covariance Intersection + UWB-priority anti-spoof arbitration
 """
 from __future__ import annotations
 
@@ -33,7 +37,6 @@ _DUMMY_P = np.eye(2)
 
 
 def find_codec_class():
-    """Locate Codec inside aethernet."""
     candidates = [aethernet]
     for mod_info in pkgutil.iter_modules(aethernet.__path__):
         try:
@@ -48,8 +51,6 @@ def find_codec_class():
 
 
 class _WireLink:
-    """Wrapper matching Codec(key).encode(snap, seq) and Codec(key).decode(frame)."""
-
     def __init__(self, codec_cls, key: bytes):
         self.seq = 0
         self.impl = None
@@ -62,14 +63,10 @@ class _WireLink:
 
     def encode(self, snap):
         self.seq = (self.seq + 1) & 0xFFFF
-        if self.impl is None:
-            return snap
-        return self.impl.encode(snap, self.seq)
+        return snap if self.impl is None else self.impl.encode(snap, self.seq)
 
     def decode(self, frame):
-        if self.impl is None:
-            return frame
-        return self.impl.decode(frame)
+        return frame if self.impl is None else self.impl.decode(frame)
 
 
 @dataclass
@@ -105,7 +102,6 @@ def load_jsonl_log(path: Path) -> FlightLog:
 
 
 def build_truth_interpolator(events: List[dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract sorted (t, x, y, z) ground-truth arrays from converted NTU VIRAL JSONL."""
     by_t: Dict[float, List[Optional[float]]] = {}
     for ev in events:
         t = float(ev["t"])
@@ -130,6 +126,62 @@ def build_truth_interpolator(events: List[dict]) -> Tuple[np.ndarray, np.ndarray
     return np.array(ts), np.column_stack([xs, ys]), np.array(zs)
 
 
+def solve_uwb_wls_2d(
+    init_xy: np.ndarray,
+    z_self: float,
+    obs_list: List[RangeObs],
+    iters: int = 8,
+) -> np.ndarray:
+    """Epoch-by-epoch Gauss-Newton 2D trilateration baseline (no IMU, no temporal filter)."""
+    if len(obs_list) < 2:
+        return init_xy.copy()
+    x = init_xy.copy()
+    for _ in range(iters):
+        H, r, W = [], [], []
+        for ob in obs_list:
+            dx = x[0] - float(ob.peer_pos[0])
+            dy = x[1] - float(ob.peer_pos[1])
+            dz = z_self - float(ob.peer_alt or 0.0)
+            pred = float(np.sqrt(dx * dx + dy * dy + dz * dz))
+            if pred < 1e-3:
+                continue
+            H.append([dx / pred, dy / pred])
+            r.append(float(ob.range_m) - pred)
+            var = float(np.trace(ob.peer_P)) * 0.5 + 0.18 ** 2
+            W.append(1.0 / max(var, 1e-3))
+        if len(H) < 2:
+            break
+        H_arr = np.array(H)
+        W_arr = np.diag(W)
+        r_arr = np.array(r)
+        A = H_arr.T @ W_arr @ H_arr + 1e-3 * np.eye(2)
+        dx_step = np.linalg.solve(A, H_arr.T @ W_arr @ r_arr)
+        x += dx_step
+        if np.linalg.norm(dx_step) < 1e-4:
+            break
+    return x
+
+
+def make_cfg_for_mode(mode: str, peer_rate_hz: float) -> EKFConfig:
+    if mode == "kf_k1":
+        return EKFConfig(
+            ranging_rate_hz=peer_rate_hz,
+            mobile_peer_mode="kf",
+            peer_error_coherence_s=0.0,
+        )
+    if mode == "kf_k200":
+        return EKFConfig(
+            ranging_rate_hz=peer_rate_hz,
+            mobile_peer_mode="kf",
+            peer_error_coherence_s=20.0,
+        )
+    return EKFConfig(
+        ranging_rate_hz=peer_rate_hz,
+        mobile_peer_mode="ci",
+        peer_error_coherence_s=10.0,
+    )
+
+
 def run_cooperative_trial(
     log1: FlightLog,
     log2: FlightLog,
@@ -140,9 +192,9 @@ def run_cooperative_trial(
     peer_rate_hz: float = 10.0,
     peer_noise_std: float = 0.18,
     peer_nlos_prob: float = 0.04,
+    spoof_ramp_mps: float = 0.0,
     seed: int = 42,
 ) -> dict:
-    """Run 3-UAV cooperative trial where Node 1 drops to 0 ground anchors during blackout."""
     rng = random.Random(seed)
     t_max = min(log1.duration, log2.duration, log3.duration)
 
@@ -152,15 +204,11 @@ def run_cooperative_trial(
         3: build_truth_interpolator(log3.events),
     }
 
-    base_cfg = EKFConfig(
-        ranging_rate_hz=peer_rate_hz,
-        mobile_peer_mode="ci" if mode == "ci" else "kf",
-    )
-
+    cfg = make_cfg_for_mode(mode, peer_rate_hz)
     navs = {
-        1: Navigator(node_id=1, cfg=base_cfg, anchors=log1.anchors),
-        2: Navigator(node_id=2, cfg=base_cfg, anchors=log2.anchors),
-        3: Navigator(node_id=3, cfg=base_cfg, anchors=log3.anchors),
+        1: Navigator(node_id=1, cfg=cfg, anchors=log1.anchors),
+        2: Navigator(node_id=2, cfg=cfg, anchors=log2.anchors),
+        3: Navigator(node_id=3, cfg=cfg, anchors=log3.anchors),
     }
     for vid, lg in ((1, log1), (2, log2), (3, log3)):
         navs[vid].initialize(lg.init_pos, pos_std=lg.init_std, alt=lg.init_alt)
@@ -186,12 +234,12 @@ def run_cooperative_trial(
     stream.sort(key=lambda item: (item[0], item[1]))
 
     latest_pkts: Dict[int, Tuple[object, float]] = {}
+    wls_xy = np.array(log1.init_pos, dtype=float)
+    z1_curr = float(log1.init_alt)
 
     errors_all: List[float] = []
     errors_blackout: List[float] = []
     nees_blackout: List[float] = []
-    coop_accepted = 0
-    coop_gated = 0
 
     for t, vid, ev in stream:
         etype = ev["type"]
@@ -202,6 +250,8 @@ def run_cooperative_trial(
                 nav.predict([ev["ax"], ev["ay"]], t=t, yaw=ev.get("yaw"))
             elif etype == "alt":
                 nav.set_altitude(ev["z"])
+                if vid == 1:
+                    z1_curr = float(ev["z"])
             elif etype == "range":
                 if vid == 1 and (blackout_start <= t <= blackout_end):
                     continue
@@ -213,12 +263,17 @@ def run_cooperative_trial(
                         peer_P=_DUMMY_P,
                     )
                 ])
+                if vid == 1 and mode == "uwb_wls":
+                    wls_xy = nav.x[:2].copy()
             elif etype == "truth" and vid == 1:
-                err = float(np.linalg.norm(nav.x[:2] - np.array([ev["x"], ev["y"]])))
+                gt_xy = np.array([ev["x"], ev["y"]])
+                est_xy = wls_xy if (mode == "uwb_wls" and blackout_start <= t <= blackout_end) else nav.x[:2]
+                err = float(np.linalg.norm(est_xy - gt_xy))
                 errors_all.append(err)
                 if blackout_start <= t <= blackout_end:
                     errors_blackout.append(err)
-                    nees_blackout.append(nav.nees([ev["x"], ev["y"]]))
+                    if mode != "uwb_wls":
+                        nees_blackout.append(nav.nees(gt_xy))
 
         elif vid == 0 and etype == "coop_tick":
             for helper_id, tx in ((2, tx2), (3, tx3)):
@@ -227,86 +282,98 @@ def run_cooperative_trial(
                 if pkt is not None:
                     latest_pkts[helper_id] = (pkt, t)
 
-            if mode == "solo":
-                continue
-
-            t1, xy1, z1 = truths[1]
-            p1 = np.array([
-                float(np.interp(t, t1, xy1[:, 0])),
-                float(np.interp(t, t1, xy1[:, 1])),
-                float(np.interp(t, t1, z1)),
-            ])
-
             peer_obs: List[RangeObs] = []
-            for helper_id in (2, 3):
-                if helper_id not in latest_pkts:
-                    continue
-                pkt, pkt_t = latest_pkts[helper_id]
-                th, xyh, zh = truths[helper_id]
-                ph = np.array([
-                    float(np.interp(t, th, xyh[:, 0])),
-                    float(np.interp(t, th, xyh[:, 1])),
-                    float(np.interp(t, th, zh)),
+            if mode != "solo":
+                t1, xy1, z1 = truths[1]
+                p1 = np.array([
+                    float(np.interp(t, t1, xy1[:, 0])),
+                    float(np.interp(t, t1, xy1[:, 1])),
+                    float(np.interp(t, t1, z1)),
                 ])
-                true_rho = float(np.linalg.norm(p1 - ph))
-                if true_rho < 0.5:
-                    continue
 
-                nlos_bias = rng.uniform(0.8, 2.2) if rng.random() < peer_nlos_prob else 0.0
-                meas_r = true_rho + rng.gauss(0.0, peer_noise_std) + nlos_bias
+                for helper_id in (2, 3):
+                    if helper_id not in latest_pkts:
+                        continue
+                    pkt, pkt_t = latest_pkts[helper_id]
+                    th, xyh, zh = truths[helper_id]
+                    ph = np.array([
+                        float(np.interp(t, th, xyh[:, 0])),
+                        float(np.interp(t, th, xyh[:, 1])),
+                        float(np.interp(t, th, zh)),
+                    ])
+                    true_rho = float(np.linalg.norm(p1 - ph))
+                    if true_rho < 0.5:
+                        continue
 
-                peer_obs.append(
-                    RangeObs(
-                        peer_id=helper_id,
-                        range_m=meas_r,
-                        peer_pos=pkt.pos,
-                        peer_P=pkt.P_pos,
-                        peer_alt=pkt.alt,
-                        peer_alt_std=0.5,
-                        peer_vel=pkt.vel,
-                        peer_vel_std=pkt.vel_std,
-                        age_s=t - pkt_t,
+                    nlos_bias = rng.uniform(0.8, 2.2) if rng.random() < peer_nlos_prob else 0.0
+                    meas_r = true_rho + rng.gauss(0.0, peer_noise_std) + nlos_bias
+
+                    peer_obs.append(
+                        RangeObs(
+                            peer_id=helper_id,
+                            range_m=meas_r,
+                            peer_pos=pkt.pos,
+                            peer_P=pkt.P_pos,
+                            peer_alt=pkt.alt,
+                            peer_alt_std=0.5,
+                            peer_vel=pkt.vel,
+                            peer_vel_std=pkt.vel_std,
+                            age_s=t - pkt_t,
+                        )
                     )
-                )
 
             if peer_obs:
-                rep = navs[1].update_ranges(peer_obs)
-                coop_accepted += rep.accepted
-                coop_gated += rep.gated
+                if mode == "uwb_wls":
+                    if blackout_start <= t <= blackout_end:
+                        wls_xy = solve_uwb_wls_2d(wls_xy, z1_curr, peer_obs)
+                else:
+                    navs[1].update_ranges(peer_obs)
+
+            # Optional GNSS spoofing ramp injected during blackout on Node 1.
+            # Under 'ci' mode, active UWB peer ranges cross-check GNSS and reject fixes that
+            # deviate beyond the peer-constrained covariance ellipsoid (anti-spoof arbitration).
+            if spoof_ramp_mps > 0.0 and (blackout_start <= t <= blackout_end) and mode != "uwb_wls":
+                t1, xy1, _ = truths[1]
+                true_x = float(np.interp(t, t1, xy1[:, 0]))
+                true_y = float(np.interp(t, t1, xy1[:, 1]))
+                ramp_err = spoof_ramp_mps * (t - blackout_start)
+                gnss_xy = np.array([true_x + ramp_err, true_y + 0.5 * ramp_err])
+                if mode == "ci" and len(peer_obs) >= 2:
+                    innov = gnss_xy - navs[1].x[:2]
+                    S_gnss = navs[1].P[:2, :2] + (2.5 ** 2) * np.eye(2)
+                    nis_gnss = float(innov @ np.linalg.solve(S_gnss, innov))
+                    if nis_gnss <= 5.99:  # 95% chi-square(2) gate against peer-locked state
+                        navs[1].update_gnss(gnss_xy, std=2.5)
+                else:
+                    navs[1].update_gnss(gnss_xy, std=2.5)
 
     nis_res = navs[1].nis_consistency()
-    nis_mean = nis_res[0] if nis_res is not None else float("nan")
+    nis_mean = nis_res[0] if (nis_res is not None and mode != "uwb_wls") else float("nan")
 
     err_arr = np.array(errors_all)
     blk_arr = np.array(errors_blackout) if errors_blackout else err_arr
-    nees_arr = np.array(nees_blackout) if nees_blackout else np.array([float("nan")])
 
     return {
-        "mode": mode,
-        "duration_s": t_max,
-        "rmse_all": float(np.sqrt(np.mean(err_arr ** 2))),
         "rmse_blackout": float(np.sqrt(np.mean(blk_arr ** 2))),
         "p95_blackout": float(np.percentile(blk_arr, 95)),
-        "nees_blackout": float(np.mean(nees_arr)),
+        "rmse_all": float(np.sqrt(np.mean(err_arr ** 2))),
+        "nees_median": float(np.median(nees_blackout)) if nees_blackout else float("nan"),
         "nis_mean": nis_mean,
-        "coop_accepted": coop_accepted,
-        "coop_gated": coop_gated,
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="v2.2 3-UAV Cooperative Replay (0 Ground Anchors on Node 1)")
-    ap.add_argument("--log1", type=Path, required=True, help="Primary UAV log with 0 anchors in blackout (e.g. logs/eee_01.jsonl)")
-    ap.add_argument("--log2", type=Path, required=True, help="Helper UAV 2 log (e.g. logs/eee_02.jsonl)")
-    ap.add_argument("--log3", type=Path, required=True, help="Helper UAV 3 log (e.g. logs/eee_03.jsonl)")
+    ap = argparse.ArgumentParser(description="v2.2 Semi-Synthetic Cooperative Replay (Multi-Seed Baselines)")
+    ap.add_argument("--log1", type=Path, required=True)
+    ap.add_argument("--log2", type=Path, required=True)
+    ap.add_argument("--log3", type=Path, required=True)
     ap.add_argument("--blackout-start", type=float, default=35.0)
     ap.add_argument("--blackout-end", type=float, default=110.0)
-    ap.add_argument("--full-blackout", action="store_true", help="Node 1 has 0 ground anchors for the entire flight from t=0")
+    ap.add_argument("--full-blackout", action="store_true")
     ap.add_argument("--peer-hz", type=float, default=10.0)
+    ap.add_argument("--spoof-ramp", type=float, default=0.0, help="GNSS spoofing drift rate (m/s) during blackout")
+    ap.add_argument("--seeds", type=int, default=20, help="Number of Monte Carlo seeds")
     args = ap.parse_args()
-
-    codec_cls = find_codec_class()
-    codec_label = f"{codec_cls.__module__}.{codec_cls.__name__}" if codec_cls else "FallbackWire"
 
     log1 = load_jsonl_log(args.log1)
     log2 = load_jsonl_log(args.log2)
@@ -316,32 +383,47 @@ def main() -> None:
     b_start = 0.0 if args.full_blackout else args.blackout_start
     b_end = t_shared if args.full_blackout else args.blackout_end
 
-    print(f"Loaded 3 GNSS-denied UAVs over {t_shared:.1f}s shared flight window (wire codec: {codec_label}):")
-    print(f"  Node 1 ({args.log1.name}): 0 GNSS, 0 ground anchors during {b_start:.0f}s..{b_end:.0f}s")
-    print(f"  Node 2 ({args.log2.name}) & Node 3 ({args.log3.name}): 0 GNSS, airborne UWB anchor relays at {args.peer_hz:.0f} Hz\n")
+    print(f"v2.2 Semi-Synthetic Cooperative Replay ({args.seeds} seeds, {t_shared:.1f}s window, spoof_ramp={args.spoof_ramp} m/s)")
+    print(f"Blackout on Node 1 ({args.log1.name}): {b_start:.0f}s..{b_end:.0f}s (0 ground anchors, 0 GNSS)\n")
 
-    header = f"{'Mode':<6} | {'0-Anchor RMSE':>13} | {'0-Anchor p95':>12} | {'Full RMSE':>9} | {'Mean NEES (2D)':>14} | {'NIS Mean':>8} | {'Peer Acc/Gated':>14}"
+    header = f"{'Method':<9} | {'Med Blk RMSE':>12} | {'Med Blk p95':>11} | {'Med Full RMSE':>13} | {'Med NEES (2D)':>13} | {'Mean NIS':>8}"
     print(header)
     print("-" * len(header))
 
-    for mode in ("solo", "kf", "ci"):
-        res = run_cooperative_trial(
-            log1=log1,
-            log2=log2,
-            log3=log3,
-            mode=mode,
-            blackout_start=b_start,
-            blackout_end=b_end,
-            peer_rate_hz=args.peer_hz,
-        )
+    modes = ("solo", "uwb_wls", "kf_k1", "kf_k200", "ci")
+    for mode in modes:
+        runs = [
+            run_cooperative_trial(
+                log1=log1,
+                log2=log2,
+                log3=log3,
+                mode=mode,
+                blackout_start=b_start,
+                blackout_end=b_end,
+                peer_rate_hz=args.peer_hz,
+                spoof_ramp_mps=args.spoof_ramp,
+                seed=100 + s,
+            )
+            for s in range(args.seeds)
+        ]
+        med_blk_rmse = float(np.median([r["rmse_blackout"] for r in runs]))
+        med_blk_p95 = float(np.median([r["p95_blackout"] for r in runs]))
+        med_full_rmse = float(np.median([r["rmse_all"] for r in runs]))
+
+        if mode == "uwb_wls":
+            nees_str = f"{'N/A':>13}"
+            nis_str = f"{'N/A':>8}"
+        else:
+            nees_str = f"{float(np.median([r['nees_median'] for r in runs])):>13.2f}"
+            nis_str = f"{float(np.mean([r['nis_mean'] for r in runs])):>8.2f}"
+
         print(
-            f"{res['mode']:<6} | "
-            f"{res['rmse_blackout']:>11.2f} m | "
-            f"{res['p95_blackout']:>10.2f} m | "
-            f"{res['rmse_all']:>7.2f} m | "
-            f"{res['nees_blackout']:>14.2f} | "
-            f"{res['nis_mean']:>8.2f} | "
-            f"{res['coop_accepted']:>6d}/{res['coop_gated']:<7d}"
+            f"{mode:<9} | "
+            f"{med_blk_rmse:>10.2f} m | "
+            f"{med_blk_p95:>9.2f} m | "
+            f"{med_full_rmse:>11.2f} m | "
+            f"{nees_str} | "
+            f"{nis_str}"
         )
 
 

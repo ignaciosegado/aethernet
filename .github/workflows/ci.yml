@@ -25,4 +25,4 @@ jobs:
           python scripts/convert_ntu_viral.py --help
           python scripts/calibrate_split.py --help
           python scripts/coop_ntu_viral.py --help
-          python replay.py --help
+          python src/aethernet/replay.py --help

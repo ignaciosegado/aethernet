@@ -13,7 +13,7 @@ Rather than competing with infrastructure-free visual-inertial odometry (VIO) in
 
 ## Core Capabilities
 
-* **Marginal Covariance Intersection (`Navigator`, `mobile_peer_mode="ci"`):** Optimizes the convex fusion weight $\omega \in (0, 1)$ minimizing $\operatorname{tr}(\mathbf{P}_{\text{fused}})$ alongside coherence-time decorrelation (`peer_error_coherence_s`) to fuse uncertain mobile-peer positions without double-counting correlated trajectory errors.
+* **Marginal Covariance Intersection (`Navigator`, `mobile_peer_mode="ci"`):** Optimizes the convex fusion weight $\omega \in (0, 1)$ to minimize the trace of the fused covariance matrix, alongside coherence-time decorrelation (`peer_error_coherence_s`), when fusing uncertain mobile-peer positions without double-counting correlated trajectory errors.
 * **Asymmetric Multipath & Spoofing Defense:** Combines per-peer EWMA NLOS gating (`nlos_ewma_beta`, `nlos_ewma_thresh`) against positive range bias with geometric range-consensus cross-checks (`_try_consensus` / Mahalanobis arbitration) to reject gradual GNSS position-ramp spoofing.
 * **32-Byte Authenticated Binary Protocol (`Codec`):** Packs node position, velocity, altitude, uncertainty bounds, sequence counter, and truncated HMAC-SHA256 authentication into 32 bytes (`~2.5 kbps` at `10 Hz`) for low-bandwidth RF and telemetry links.
 * **Drop-In Flight-Stack Integration:** Outputs covariance-calibrated state snapshots compatible with standard MAVLink external vision aiding (`VISION_POSITION_ESTIMATE` / `ODOMETRY`) on PX4 and ArduPilot without requiring hardware modifications to host mast infrastructure.

@@ -1,7 +1,4 @@
-# Add these two arguments to argparse in scripts/convert_ntu_viral.py:
-#   ap.add_argument("--save-cal", type=Path, default=None, help="Export calibrated anchors + yaw offset to JSON")
-#   ap.add_argument("--load-cal", type=Path, default=None, help="Load frozen anchors + yaw offset (blind test mode)")
-
+import argparse
 import json
 from pathlib import Path
 from typing import Dict, Tuple
@@ -36,3 +33,33 @@ def load_calibration(cal_path: Path) -> Tuple[Dict[int, AnchorInfo], float, floa
         for k, v in payload["anchors"].items()
     }
     return anchors, float(payload["yaw_offset_rad"]), float(payload.get("uwb_noise_scale", 1.0))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="NTU VIRAL calibration utilities",
+    )
+    ap.add_argument(
+        "--save-cal",
+        type=Path,
+        default=None,
+        help="Export calibrated anchors + yaw offset to JSON",
+    )
+    ap.add_argument(
+        "--load-cal",
+        type=Path,
+        default=None,
+        help="Load frozen anchors + yaw offset (blind test mode)",
+    )
+    args = ap.parse_args()
+
+    if args.load_cal is not None:
+        anchors, yaw_offset, residual_scale = load_calibration(args.load_cal)
+        print(
+            f"Loaded {len(anchors)} anchors from {args.load_cal} "
+            f"(yaw_offset={yaw_offset:.6f} rad, uwb_noise_scale={residual_scale:.6g})"
+        )
+
+
+if __name__ == "__main__":
+    main()
